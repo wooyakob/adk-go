@@ -8,6 +8,9 @@
 *.so
 *.dylib
 
+# Example binaries (Linux extensionless, produced by go build ./examples/...)
+petinsurance
+
 # Test binary, built with `go test -c`
 *.test
 
