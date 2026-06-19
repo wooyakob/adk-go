@@ -27,6 +27,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/adk/agent"
@@ -99,6 +100,9 @@ type policyHolder struct {
 // -----------------------------------------------------------------------------
 // In-memory "database" – pre-seeded with demo data
 // -----------------------------------------------------------------------------
+
+// dbMu guards concurrent access to the policies and claims maps.
+var dbMu sync.RWMutex
 
 var (
 	policies = map[string]*policyHolder{
@@ -243,6 +247,8 @@ type LookupPolicyOutput struct {
 }
 
 func lookupPolicy(_ tool.Context, input LookupPolicyInput) (LookupPolicyOutput, error) {
+	dbMu.RLock()
+	defer dbMu.RUnlock()
 	p, ok := policies[input.PolicyNumber]
 	if !ok {
 		return LookupPolicyOutput{Found: false, Error: fmt.Sprintf("No policy found for number %q.", input.PolicyNumber)}, nil
@@ -279,6 +285,8 @@ type CheckCoverageOutput struct {
 }
 
 func checkCoverageTool(_ tool.Context, input CheckCoverageInput) (CheckCoverageOutput, error) {
+	dbMu.RLock()
+	defer dbMu.RUnlock()
 	p, ok := policies[input.PolicyNumber]
 	if !ok {
 		return CheckCoverageOutput{PolicyNumber: input.PolicyNumber, Diagnosis: input.Diagnosis, Covered: false, Notes: fmt.Sprintf("Policy %q not found.", input.PolicyNumber)}, nil
@@ -313,6 +321,9 @@ type SubmitClaimOutput struct {
 }
 
 func submitClaim(_ tool.Context, input SubmitClaimInput) (SubmitClaimOutput, error) {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
 	p, ok := policies[input.PolicyNumber]
 	if !ok {
 		return SubmitClaimOutput{Success: false, Message: fmt.Sprintf("Policy %q not found. Please verify the policy number.", input.PolicyNumber)}, nil
@@ -327,11 +338,20 @@ func submitClaim(_ tool.Context, input SubmitClaimInput) (SubmitClaimOutput, err
 		}, nil
 	}
 
-	// Generate a new claim ID.
-	id := fmt.Sprintf("CLM-%04d", 5000+rand.IntN(9000))
+	// Generate a unique claim ID, retrying on collision.
+	var id string
+	for {
+		id = fmt.Sprintf("CLM-%04d", 5000+rand.IntN(9000))
+		if _, exists := claims[id]; !exists {
+			break
+		}
+	}
 
-	// Quick reimbursement estimate (deductible already met or partially met check omitted for simplicity).
+	// Quick reimbursement estimate.
 	remaining := p.AnnualLimit - p.UsedThisYear
+	if remaining < 0 {
+		remaining = 0
+	}
 	eligible := input.TotalCost - p.Deductible
 	if eligible < 0 {
 		eligible = 0
@@ -388,6 +408,8 @@ type GetClaimStatusOutput struct {
 }
 
 func getClaimStatus(_ tool.Context, input GetClaimStatusInput) (GetClaimStatusOutput, error) {
+	dbMu.RLock()
+	defer dbMu.RUnlock()
 	c, ok := claims[input.ClaimID]
 	if !ok {
 		return GetClaimStatusOutput{Found: false, Error: fmt.Sprintf("No claim found with ID %q.", input.ClaimID)}, nil
@@ -428,6 +450,8 @@ type ListClaimsOutput struct {
 }
 
 func listClaimsForPolicy(_ tool.Context, input ListClaimsInput) (ListClaimsOutput, error) {
+	dbMu.RLock()
+	defer dbMu.RUnlock()
 	var result []ClaimSummary
 	for _, c := range claims {
 		if c.PolicyNumber == input.PolicyNumber {
@@ -464,9 +488,15 @@ type AdjudicateClaimOutput struct {
 }
 
 func adjudicateClaim(_ tool.Context, input AdjudicateClaimInput) (AdjudicateClaimOutput, error) {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+
 	c, ok := claims[input.ClaimID]
 	if !ok {
 		return AdjudicateClaimOutput{Success: false, ClaimID: input.ClaimID, Message: fmt.Sprintf("Claim %q not found.", input.ClaimID)}, nil
+	}
+	if c.Status == StatusApproved || c.Status == StatusDenied {
+		return AdjudicateClaimOutput{Success: false, ClaimID: c.ID, Message: fmt.Sprintf("Claim %s has already been adjudicated (status: %s).", c.ID, c.Status)}, nil
 	}
 
 	switch strings.ToLower(input.Decision) {
@@ -520,12 +550,18 @@ type CalcReimbursementOutput struct {
 }
 
 func calculateReimbursement(_ tool.Context, input CalcReimbursementInput) (CalcReimbursementOutput, error) {
+	dbMu.RLock()
+	defer dbMu.RUnlock()
+
 	p, ok := policies[input.PolicyNumber]
 	if !ok {
 		return CalcReimbursementOutput{}, fmt.Errorf("policy %q not found", input.PolicyNumber)
 	}
 
 	remaining := p.AnnualLimit - p.UsedThisYear
+	if remaining < 0 {
+		remaining = 0
+	}
 	eligible := input.TotalCost - p.Deductible
 	if eligible < 0 {
 		eligible = 0
